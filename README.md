@@ -42,6 +42,25 @@ pair it with a configured Neovim distribution like
 fuzzy finders, status line — all the things that make a tablet keyboard
 into a real editor). Vanilla Neovim works but is bare.
 
+### 3. Keeping git (and your credentials) off your production machine
+
+Standard deploy loop: develop locally → push to GitHub → ssh into the
+VPS → `git pull` → build → restart. That `git pull` step forces the
+production box to authenticate against your code host. Three ugly
+options: make the repo public (leaks proprietary code), install a
+deploy key (another credential to rotate), or paste a PAT on the
+production box (yet another secret on a multi-tenant target where you
+do **not** want extra blast radius).
+
+This plugin sidesteps all three. Develop locally, push to your private
+remote, build locally — then rsync the result (built artifacts, or the
+source plus a remote build hook) straight into the VPS with `<leader>rs`.
+Production never needs a git client, a deploy key, or a PAT. Pair with
+a `commands` array (see schema below) so `<leader>rc` triggers
+`docker compose up -d --build`, `systemctl restart <svc>`, `pnpm
+install && pm2 reload`, or whatever finishes the deploy — all over the
+same ssh connection that did the push.
+
 ---
 
 ## What this is NOT
