@@ -495,6 +495,14 @@ function M.drift(opts)
   local root, cfg = M.find_project()
   if not root then notify(cfg, vim.log.levels.WARN); return end
 
+  -- Always announce. Drift can take 5-30s on a slow link or with
+  -- --checksum across a large tree; without a start message the user
+  -- sees nothing and assumes the keypress was lost. Even when called
+  -- from M.push (with quiet=true), this remains visible — push then
+  -- emits its own "pushing…" after the gate passes, so the user
+  -- watches a two-step flow rather than guessing at silence.
+  notify("drift: checking remote against HEAD…")
+
   local state = git_state(root)
   local compare_path = root .. "/"
   local cleanup = function() end

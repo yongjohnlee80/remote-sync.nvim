@@ -1,22 +1,74 @@
 # remote-sync.nvim
 
 Local-first, git-backed remote-dev sync for Neovim. You edit locally with full
-LSP / treesitter / DAP, then ship to a real VPS with one keypress. The plugin
-wraps `rsync` for transport and uses a small git repo at the mirror root as
-its **drift baseline** — so push refuses cleanly when the remote has changed
-under you, and pull can leave you with a real merge instead of a silent
-overwrite.
-
-It's designed for the case where:
-
-- The remote is a working server (Docker host, mailcow, nginx, …) — you
-  can't run a development environment there, but you _can_ rsync into it.
-- You may or may not be the only person/process touching the remote tree.
-- You want editing to feel local, not "ssh + tmux + nano".
+LSP / treesitter / DAP, then ship to a real machine with one keypress. The
+plugin wraps `rsync` for transport and uses a small git repo at the mirror
+root as its **drift baseline** — push refuses cleanly when the remote has
+changed under you, and pull can leave you with a real merge instead of a
+silent overwrite.
 
 If you've ever lost an evening to "wait, did this config land on the box?
 why is the service not picking it up? did someone else edit it?" — this
 plugin is an attempt to fix the workflow underneath that.
+
+---
+
+## What this is for
+
+Two real-world use cases drive the design:
+
+### 1. Editing production configuration on a VPS
+
+You run mailcow / forgejo / nginx / vaultwarden / postgres on a server you
+can't develop on directly, but you can rsync into. Edit the configs locally
+(with full LSP, treesitter, dotfiles, AI tooling), ship with `<leader>rs`,
+optionally trigger a service reload over ssh via a project-configured
+command. The drift gate stops you from clobbering changes another admin
+made after your last pull.
+
+### 2. Coding from an iPad / second laptop into your real workstation
+
+Mirror a project tree from your workstation to a tablet's lightweight
+Neovim, edit there, push back. Single-user station? Set
+`"detection": "lazy"` for the fastest path — mtime-based, no checksum
+overhead. The exclude list should drop binaries, build outputs, and the
+heavy ephemera (`node_modules`, `target`, `dist`, `.direnv`, `vendor`);
+everything else (source, configs, dotfiles) syncs at acceptable speed.
+
+Pull/push will still take longer on big repos than over LAN file-sharing —
+this is rsync over ssh, not magic. For the tablet side to feel *good*,
+pair it with a configured Neovim distribution like
+[autovim](https://github.com/yongjohnlee80/autovim) (LSP, treesitter, DAP,
+fuzzy finders, status line — all the things that make a tablet keyboard
+into a real editor). Vanilla Neovim works but is bare.
+
+---
+
+## What this is NOT
+
+- **Not a version-control system for your code.** For real code projects,
+  use git on its own — branches, history, code review, the whole thing.
+  The `.git` this plugin maintains at each mirror root is a *sync-state
+  ledger*: it captures "what the remote looked like the last time we
+  agreed" so drift detection has a baseline. It's not for code history,
+  branches, or collaboration.
+- **Don't commit production-config mirrors to a public git remote.** Those
+  trees contain server config, hostnames, internal topology, and
+  occasionally secrets that slipped past the exclude list. The local
+  `.git` is meant to *stay local*. If you want snapshots off-machine,
+  push to a private bare repo on a host you trust — never to a public
+  GitHub. Production configuration is not for sharing, full stop.
+- **Not a backup tool.** Production *state* — Postgres data directories,
+  mail spools, attachments, container volumes — should be excluded from
+  sync, full stop. The defaults cover `.git`, `.env`, certs (`*.pem`,
+  `*.key`, …), and the usual build-output suspects (`node_modules`,
+  `vendor`, `.direnv`, `target`), but they do **not** know what your
+  project calls its runtime-state directory — that's project-specific
+  (`data`, `db`, `var`, `volumes`, `storage`, …). You must add those
+  names to `.autovim-remote.json`'s `exclude` list yourself. Back state
+  up with [restic](https://restic.net/),
+  [borgmatic](https://torsion.org/borgmatic/), or your provider's
+  snapshot tooling. **This plugin moves *configuration*, not state.**
 
 ---
 
@@ -135,6 +187,41 @@ source of truth for "what's in scope" is `.autovim-remote.json`'s
 
 ---
 
+## Permissions, Docker, and the runtime-state directory
+
+rsync runs as your ssh user on the remote. App-level config dirs
+(`/srv/<service>/`, `/home/<user>/Docker/<service>/`, etc.) are usually
+owned by *that* user — pushing into them works. The runtime-state
+directory next to those configs is a different story.
+
+Most Docker images run their container processes as a non-root user
+*inside* the container — `999` for postgres, `33` for nginx, `911` for
+many linuxserver images, `1000` for forgejo, and so on. The bind-mounted
+state directory on the host is owned by *that* uid, not yours. Symptoms
+when this collides with a push:
+
+- `rsync: failed to set permissions on "<path>": Operation not permitted`
+- `rsync: chown failed`
+- The push appears to succeed but the container fails to read its own
+  files on next start, because rsync rewrote ownership underneath it.
+
+**Rule of thumb: exclude your project's runtime-state directory from
+`.autovim-remote.json`.** What that directory is called varies by
+project: `data`, `db`, `var`, `volumes`, `storage`, `pgdata`, `mysql`,
+service-named dirs (`mailcow-data/`, …). Find them once per project and
+list them in `exclude`. The plugin's defaults intentionally don't guess
+at this name — there's no universal convention.
+
+The destination directory itself — where compose files, `.env`, app
+configs (e.g. `app.ini`, `nginx.conf`, `mailcow.conf`) live — must be
+readable+writable by your ssh user. That's the part you sync. Never
+fight rsync into pushing into the runtime-state dir; if you genuinely
+need to edit something inside it, ssh in and do the edit as the
+container's uid (`sudo`, `docker exec`, or briefly chowning via the
+service's own tooling).
+
+---
+
 ## `.autovim-remote.json`
 
 ```json
@@ -215,6 +302,13 @@ The pre-push snap commit is your insurance. `git log` in the mirror
 root, find the `snap pre-push <iso>` before yours, `git checkout <hash>
 -- path/to/file`, push. Or `:RemoteSyncForcePush` if you want to roll the
 remote all the way back.
+
+**"`rsync: failed to set permissions` / `Operation not permitted`."**
+Your ssh user doesn't own (or can't chown) something rsync is trying to
+write. Almost always a runtime-state directory owned by a container's
+uid. Add the directory name (`data`, `db`, `volumes`, …) to your
+`.autovim-remote.json` `exclude` list and re-push. See the *Permissions*
+section above for the full picture.
 
 ---
 
