@@ -36,11 +36,22 @@ local DEFAULT_EXCLUDES = {
   -- Cert / key material. Lives on the host that uses it; certbot etc.
   -- regenerate on the remote, so syncing locally either goes stale or
   -- (worse) round-trips a private key into local git history.
-  -- File patterns cover most cases; `ssl` (the directory name) is added
-  -- because cert dirs are sometimes locked down (mode 700) on the
-  -- remote — rsync's recursive scan errors out trying to read them
-  -- even when every file inside would be excluded by the patterns.
+  --
+  -- Three layers of patterns to cover the common formats:
+  --   1. Extension globs — TLS / PKCS material (PEM, DER variants).
+  --   2. OpenSSH key conventions — extension-less files named `id_*`
+  --      (user keys: id_rsa, id_ed25519, id_ecdsa, id_dsa) and the
+  --      `*_key` suffix used by sshd (ssh_host_ed25519_key, etc).
+  --   3. Algorithm-suffix variants — `*_ed25519`, `*_ecdsa`, `*_rsa`
+  --      catch the `<purpose>_<algo>` convention even without `_key`.
+  --
+  -- `ssl` (bare directory name) is added because cert dirs are sometimes
+  -- locked down (mode 700) on the remote — rsync's recursive scan errors
+  -- out trying to read them even when every file inside would be excluded
+  -- by the patterns. The auto-skip-unreadable scan (default-on) catches
+  -- whatever these patterns miss.
   "*.pem", "*.key", "*.crt", "*.cert", "*.p12", "*.pfx",
+  "id_*", "*_key", "*_ed25519", "*_ecdsa", "*_rsa",
   "ssl",
 }
 
@@ -126,6 +137,26 @@ end
 -- Pretty-write a default .autovim-remote.json so the user can edit it
 -- by hand without staring at single-line JSON. Same shape the README
 -- documents; only host / remote_path are project-specific.
+--
+-- Two scaffolded fields the user is expected to engage with:
+--
+--   `preserve_perms: true` — keep rsync's default behavior of syncing
+--     file permissions and mtimes. Flip to `false` when the destination
+--     tree is owned by another user (e.g. /etc/<service>/ via ACL) so
+--     push doesn't trip "Operation not permitted (1)" on chmod/utime.
+--     The accompanying `_preserve_perms_comment` explains the trade-off.
+--
+--   `commands: [grant-acl, normalize-perms]` — two POSIX-ACL recipes:
+--     grant-acl       grants the ssh user rwx on the remote tree (one-time
+--                     per teammate per machine, requires sudo).
+--     normalize-perms re-establishes root ownership + canonical modes
+--                     after a `preserve_perms: false` push leaves new
+--                     files owned by the ssh user. Run ad-hoc when
+--                     ownership/mode drift becomes visible.
+--
+-- The leading `_comment` and `_preserve_perms_comment` fields are
+-- JSON-tolerated metadata — vim.json.decode parses them, the plugin
+-- ignores them.
 local function write_default_config(path, host, remote_path)
   local function jstr(s) return vim.json.encode(s) end
   local lines = {
@@ -141,7 +172,42 @@ local function write_default_config(path, host, remote_path)
   vim.list_extend(lines, {
     "  ],",
     "  \"delete\": false,",
-    "  \"detection\": \"" .. DEFAULT_DETECTION_MODE .. "\"",
+    "  \"detection\": \"" .. DEFAULT_DETECTION_MODE .. "\",",
+    "  \"_preserve_perms_comment\": " .. jstr(
+      "Default true keeps rsync's archive-mode metadata sync (perms + mtime). Flip to false when the destination " ..
+      "tree is owned by another user (e.g. /etc/<service>/ accessed via ACL): chmod/utime are owner-only syscalls " ..
+      "regardless of ACLs, so preserving them yields 'Operation not permitted (1)'. Trade-off when false: new files " ..
+      "land with ssh-user ownership and remote-umask modes; run the `normalize-perms` command below to re-establish " ..
+      "root ownership and executable bits when needed."
+    ) .. ",",
+    "  \"preserve_perms\": true,",
+    "  \"commands\": [",
+    "    {",
+    "      \"_comment\": " .. jstr(
+      "Grant rwx ACL to the current ssh user so rsync can write to a root-owned remote tree without changing " ..
+      "ownership. One-time per teammate per machine. If sudo on the remote requires a password, run this manually " ..
+      "on the VM — the plugin runs over a non-TTY ssh and can't supply a password. Edit the path to match your " ..
+      "remote_path, or delete this whole entry if not relevant."
+    ) .. ",",
+    "      \"name\": \"grant-acl\",",
+    "      \"cmd\": " .. jstr(
+      "sudo setfacl -R -m u:$(whoami):rwx -m d:u:$(whoami):rwx " .. remote_path
+    ) .. ",",
+    "    },",
+    "    {",
+    "      \"_comment\": " .. jstr(
+      "Post-push normalization. When `preserve_perms` is false, new files land owned by the ssh user with " ..
+      "remote-umask modes. This re-establishes root:root ownership over the whole tree and re-applies 0755 to " ..
+      "*.sh files. Edit the chown target (root:root vs <user>:<group>) and the chmod patterns (*.sh, *.py, etc.) " ..
+      "to match your remote conventions, or delete this entry if your tree is user-owned and preserve_perms=true."
+    ) .. ",",
+    "      \"name\": \"normalize-perms\",",
+    "      \"cmd\": " .. jstr(
+      "sudo chown -R root:root " .. remote_path ..
+      " && sudo find " .. remote_path .. " -type f -name '*.sh' -exec chmod 755 {} +"
+    ),
+    "    }",
+    "  ]",
     "}",
   })
   vim.fn.writefile(lines, path)
@@ -278,6 +344,183 @@ local function notify(msg, level)
   vim.notify("[remote-sync] " .. msg, level or vim.log.levels.INFO)
 end
 
+-- Maps common rsync/ssh failure-stderr patterns to a one-line hint that
+-- gets surfaced alongside the bare "(exit N)" message. The full stderr
+-- is still in the log buffer (<leader>rl) — this is just a quick "look
+-- here first" pointer for the most-frequent failure modes. Returns nil
+-- when nothing matches; the caller falls back to the plain exit-code
+-- notify.
+local function diagnose(_exit_code, stderr)
+  stderr = stderr or ""
+  -- Remote-side missing rsync. Surfaces from rsync exit 12 (protocol
+  -- stream error) when the remote bash returns "command not found".
+  if stderr:find("rsync: command not found") or stderr:find("rsync%-server: command not found") then
+    return "rsync not installed on the remote — install it there (e.g. `apt install rsync`)"
+  end
+  -- ssh auth failures.
+  if stderr:find("Permission denied %(publickey") or stderr:find("Permission denied, please try again") then
+    return "ssh permission denied — your key is not in the remote authorized_keys (or wrong user)"
+  end
+  -- Host key issues.
+  if stderr:find("REMOTE HOST IDENTIFICATION HAS CHANGED") then
+    return "ssh host key CHANGED (MITM or VM reprovisioned) — verify, then refresh ~/.ssh/known_hosts"
+  end
+  if stderr:find("Host key verification failed") then
+    return "ssh host key mismatch — refresh the host's entry in ~/.ssh/known_hosts"
+  end
+  -- Network reachability.
+  if stderr:find("Connection refused") then
+    return "ssh connection refused — sshd not running, wrong port, or firewalled"
+  end
+  if stderr:find("Connection timed out") or stderr:find("Operation timed out") then
+    return "ssh connection timed out — host unreachable or firewalled"
+  end
+  if stderr:find("Could not resolve hostname") or stderr:find("Name or service not known") then
+    return "hostname did not resolve — DNS issue or typo in `host` field"
+  end
+  -- Path issues on the remote.
+  if stderr:find("rsync: change_dir.-No such file or directory")
+     or stderr:find("rsync: link_stat.-No such file or directory")
+     or stderr:find("rsync: %[sender%].-No such file or directory") then
+    return "remote_path does not exist on the remote — create it or fix the path in .autovim-remote.json"
+  end
+  -- Partial-transfer due to unreadable files on the remote (typical: 0600
+  -- private keys / TLS material owned by root that the ssh user can't open).
+  -- rsync exits 23 ("partial") — bulk of files DID transfer, only restricted
+  -- ones were skipped. Surface the first/last skipped path so the user can
+  -- act: add it to `exclude`, or run rsync as a privileged user on the remote.
+  local denied = stderr:match('failed to open "([^"]+)": Permission denied %(13%)')
+  if denied then
+    -- Count how many distinct files got skipped so the hint is honest about
+    -- whether this is one stray file or a whole tree.
+    local count, seen = 0, {}
+    for path in stderr:gmatch('failed to open "([^"]+)": Permission denied %(13%)') do
+      if not seen[path] then
+        seen[path] = true
+        count = count + 1
+      end
+    end
+    local example = denied
+    local trailer = count > 1 and string.format(" (and %d more)", count - 1) or ""
+    return string.format(
+      "rsync skipped unreadable remote file: %s%s\n   → add to `exclude` in .autovim-remote.json, or run privileged on the remote (rsync_path: \"sudo rsync\")",
+      example, trailer
+    )
+  end
+  -- Filesystem / quota.
+  if stderr:find("Read%-only file system") then
+    return "destination filesystem is read-only — check mount options or destination path"
+  end
+  if stderr:find("No space left on device") or stderr:find("Disk quota exceeded") then
+    return "disk full or quota exceeded on the destination"
+  end
+  return nil
+end
+
+-- Detects rsync exit 23 caused EXCLUSIVELY by per-file Permission-denied
+-- skips (typical: 0600 keys/certs the ssh user can't read on the remote).
+-- Returns the deduplicated list of skipped paths in that case, or nil when
+-- the failure is anything else — including exit 23 mixed with other errors,
+-- which deserves the full ERROR treatment.
+local function rsync_perm_skips_only(out)
+  if out.code ~= 23 then return nil end
+  local stderr = out.stderr or ""
+  local skips, seen = {}, {}
+  for line in stderr:gmatch("[^\n]+") do
+    if line:match("^%s*$") or line:match("^rsync error: some files") then
+      -- blank or the trailing "code 23" summary — fine to ignore
+    else
+      local path = line:match('failed to open "([^"]+)": Permission denied %(13%)')
+      if path then
+        if not seen[path] then
+          seen[path] = true
+          table.insert(skips, path)
+        end
+      else
+        -- some other stderr line — not a pure perm-skip case; bail.
+        return nil
+      end
+    end
+  end
+  if #skips == 0 then return nil end
+  return skips
+end
+
+-- Compose an error notify with a diagnosed hint when one applies. rsync
+-- exit 23 with only-permission-denied stderr is reframed as a WARN-level
+-- "skipped N files" notify since the bulk of the transfer succeeded —
+-- rsync continues past per-file errors by design.
+--
+-- Returns true when the failure is fatal (caller should abort), false
+-- when it's a soft warning the caller should treat as success-with-skips.
+local function notify_failure(action, out)
+  local skips = rsync_perm_skips_only(out)
+  if skips then
+    local first = skips[1]
+    local trailer = #skips > 1 and string.format(" (and %d more)", #skips - 1) or ""
+    local plural = #skips == 1 and "" or "s"
+    notify(
+      string.format(
+        "%s ok; skipped %d unreadable remote file%s: %s%s\n   → add to `exclude` in .autovim-remote.json, or run privileged on the remote (rsync_path: \"sudo rsync\"). <leader>rl for log.",
+        action, #skips, plural, first, trailer
+      ),
+      vim.log.levels.WARN
+    )
+    return false
+  end
+
+  local base = action .. " failed (exit " .. out.code .. "). <leader>rl for log."
+  local hint = diagnose(out.code, out.stderr)
+  if hint then
+    notify(hint .. "\n" .. base, vim.log.levels.ERROR)
+  else
+    notify(base, vim.log.levels.ERROR)
+  end
+  return true
+end
+
+-- Pre-scan the remote tree for files the ssh user can't read. Returns
+-- (via on_done) a list of paths relative to cfg.remote_path, anchored
+-- with a leading "/" so they compose directly with rsync's `--exclude`.
+-- Used to pre-empt the per-file `Permission denied (13)` failures that
+-- otherwise pile up as `code 23` after rsync has already wasted a round
+-- trip per file.
+--
+-- POSIX-portable: uses `cd … && find . -type f \! -readable | sed …`
+-- — works on GNU and BSD find. ssh BatchMode=yes prevents an interactive
+-- password prompt from blocking the editor. On any failure (ssh down,
+-- auth fail, path missing) we pass an empty list — the rsync that
+-- follows will surface the real error via diagnose().
+--
+-- Default-on. Opt out by setting `"auto_skip_unreadable": false` in
+-- .autovim-remote.json.
+local function discover_unreadable_remote(cfg, on_done)
+  if cfg.auto_skip_unreadable == false then
+    on_done({})
+    return
+  end
+  -- POSIX shell-quote remote_path: single-quote wrap with embedded-quote
+  -- escape. Embedded single quotes in remote paths are exotic but cheap
+  -- to handle.
+  local quoted = "'" .. cfg.remote_path:gsub("'", "'\\''") .. "'"
+  local find_cmd = string.format(
+    "cd %s 2>/dev/null && find . -type f \\! -readable 2>/dev/null | sed 's|^\\./||'",
+    quoted
+  )
+  vim.system({ "ssh", "-o", "BatchMode=yes", cfg.host, find_cmd }, { text = true },
+    function(out)
+      vim.schedule(function()
+        local skips = {}
+        for line in (out.stdout or ""):gmatch("[^\n]+") do
+          if line ~= "" then
+            table.insert(skips, "/" .. line)  -- anchor to source root
+          end
+        end
+        on_done(skips)
+      end)
+    end)
+end
+
 local function run_async(cmd, on_done)
   vim.system(cmd, { text = true }, function(out)
     vim.schedule(function() on_done(out) end)
@@ -362,14 +605,24 @@ local function maybe_commit_snap(root, cfg, label, on_done)
         notify("`git add` failed; snapshot skipped", vim.log.levels.WARN)
         on_done(); return
       end
-      -- After staging, status --porcelain shows staged differences from
-      -- HEAD. Empty here means: nothing in scope changed → skip commit.
-      git(root, { "status", "--porcelain" }, function(s)
-        if s.code ~= 0 then
-          notify("`git status` failed; snapshot skipped", vim.log.levels.WARN)
+      -- Check for STAGED changes specifically. `git diff --cached --quiet`
+      -- returns 0 when nothing is staged, 1 when something is staged. Any
+      -- other code is a genuine git error.
+      --
+      -- Was previously `git status --porcelain` which also reports
+      -- untracked files (`?? path`) — those aren't staged and will never
+      -- be committed (the rsync-exclude pathspec keeps them untracked by
+      -- design). Treating untracked-only as "has changes" caused the
+      -- subsequent commit to fail with "nothing added to commit", which
+      -- the plugin surfaced as a misleading "snapshot commit failed"
+      -- warning even though nothing was actually wrong.
+      git(root, { "diff", "--cached", "--quiet" }, function(s)
+        if s.code == 0 then
+          -- Nothing staged in scope; not an error — just skip the commit.
           on_done(); return
         end
-        if s.stdout == nil or s.stdout:gsub("%s+", "") == "" then
+        if s.code ~= 1 then
+          notify("`git diff --cached` failed; snapshot skipped", vim.log.levels.WARN)
           on_done(); return
         end
         local msg = "snap " .. label .. " " .. os.date("!%Y-%m-%dT%H:%M:%SZ")
@@ -377,7 +630,11 @@ local function maybe_commit_snap(root, cfg, label, on_done)
           if c.code == 0 then
             notify("snapshot: " .. msg)
           else
-            notify("snapshot commit failed", vim.log.levels.WARN)
+            -- Surface the actual git stderr so genuine failures
+            -- (hooks, identity, etc.) are debuggable from the notify.
+            local detail = (c.stderr or ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if detail == "" then detail = "exit " .. tostring(c.code) end
+            notify("snapshot commit failed: " .. detail, vim.log.levels.WARN)
           end
           on_done()
         end)
@@ -411,26 +668,44 @@ function M.pull(opts)
   if not opts.quiet then
     notify("pulling " .. cfg.host .. ":" .. cfg.remote_path .. " → " .. root)
   end
-  -- -O: omit dir times (kills phantom drift from container-bumped parent
-  -- mtimes). Detection flags per mode (lazy/safe/paranoid) layer on top.
-  local cmd = vim.list_extend(
-    { "rsync", "-az", "-O", "--no-owner", "--no-group", "--info=stats1" },
-    detection_flags(cfg, "pull")
-  )
-  vim.list_extend(cmd, exclude_args(cfg.exclude))
-  table.insert(cmd, source_spec(cfg))
-  table.insert(cmd, dest_spec(root))
 
-  run_async(cmd, function(out)
-    record(root, "pull", out.code, out.stdout, out.stderr)
-    if out.code ~= 0 then
-      notify("pull failed (exit " .. out.code .. "). <leader>rl for log.", vim.log.levels.ERROR)
-      if opts.on_done then opts.on_done(false) end
-      return
+  -- Phase 1: discover files the ssh user can't read on the remote
+  -- (default-on; opt out via cfg.auto_skip_unreadable=false). Phase 2
+  -- runs rsync with those paths appended to --exclude so we never hit
+  -- "Permission denied (13)" in the actual transfer.
+  discover_unreadable_remote(cfg, function(auto_skips)
+    if #auto_skips > 0 and not opts.quiet then
+      local example = auto_skips[1]
+      local trailer = #auto_skips > 1 and string.format(" (and %d more)", #auto_skips - 1) or ""
+      notify(string.format("auto-excluding %d unreadable file%s on remote: %s%s",
+        #auto_skips, #auto_skips == 1 and "" or "s", example, trailer))
     end
-    maybe_commit_snap(root, cfg, "pull", function()
-      if not opts.quiet then notify("pull complete") end
-      if opts.on_done then opts.on_done(true) end
+    -- -O: omit dir times (kills phantom drift from container-bumped parent
+    -- mtimes). Detection flags per mode (lazy/safe/paranoid) layer on top.
+    local cmd = vim.list_extend(
+      { "rsync", "-az", "-O", "--no-owner", "--no-group", "--info=stats1" },
+      detection_flags(cfg, "pull")
+    )
+    vim.list_extend(cmd, exclude_args(cfg.exclude))
+    for _, x in ipairs(auto_skips) do table.insert(cmd, "--exclude=" .. x) end
+    table.insert(cmd, source_spec(cfg))
+    table.insert(cmd, dest_spec(root))
+
+    run_async(cmd, function(out)
+      record(root, "pull", out.code, out.stdout, out.stderr)
+      if out.code ~= 0 then
+        if notify_failure("pull", out) then
+          if opts.on_done then opts.on_done(false) end
+          return
+        end
+        -- soft fail (perm-skips only): notify already issued a WARN; fall
+        -- through to the success path so the snapshot still records the
+        -- bulk of the transfer.
+      end
+      maybe_commit_snap(root, cfg, "pull", function()
+        if not opts.quiet and out.code == 0 then notify("pull complete") end
+        if opts.on_done then opts.on_done(true) end
+      end)
     end)
   end)
 end
@@ -544,21 +819,31 @@ function M.drift(opts)
   -- Drift answers "did the content drift?" — mtime/perm differences
   -- don't represent that. The push/pull paths still preserve mtimes via
   -- the default `-a` flag set; only drift ignores them.
-  local cmd = vim.list_extend(
-    { "rsync", "-azni", "-O", "--no-owner", "--no-group", "--no-times", "--no-perms", "--dry-run" },
-    detection_flags(cfg, "drift")
-  )
-  vim.list_extend(cmd, exclude_args(cfg.exclude))
-  table.insert(cmd, source_spec(cfg))
-  table.insert(cmd, compare_path)
+  --
+  -- Pre-scans the remote for unreadable files (auto-skip-unreadable,
+  -- default-on) and excludes them from the comparison so they don't
+  -- yield exit 23 noise in the drift report — drift covers what's
+  -- actually checkable.
+  discover_unreadable_remote(cfg, function(auto_skips)
+    local cmd = vim.list_extend(
+      { "rsync", "-azni", "-O", "--no-owner", "--no-group", "--no-times", "--no-perms", "--dry-run" },
+      detection_flags(cfg, "drift")
+    )
+    vim.list_extend(cmd, exclude_args(cfg.exclude))
+    for _, x in ipairs(auto_skips) do table.insert(cmd, "--exclude=" .. x) end
+    table.insert(cmd, source_spec(cfg))
+    table.insert(cmd, compare_path)
 
-  run_async(cmd, function(out)
-    cleanup()
-    record(root, "drift", out.code, out.stdout, out.stderr)
-    if out.code ~= 0 then
-      notify("drift check failed (exit " .. out.code .. "). <leader>rl for log.", vim.log.levels.ERROR)
-      if opts.on_done then opts.on_done(false, out) end
-      return
+    run_async(cmd, function(out)
+      cleanup()
+      record(root, "drift", out.code, out.stdout, out.stderr)
+      if out.code ~= 0 then
+        if notify_failure("drift check", out) then
+          if opts.on_done then opts.on_done(false, out) end
+          return
+        end
+        -- soft fail: report the drift we COULD compute; skipped files just
+      -- don't appear in the comparison.
     end
     local lines = {}
     for _, l in ipairs(vim.split(out.stdout or "", "\n", { plain = true })) do
@@ -571,6 +856,7 @@ function M.drift(opts)
       notify(("drift: %d file(s) differ on remote vs HEAD. <leader>rl for details."):format(#lines), vim.log.levels.WARN)
       if opts.on_done then opts.on_done(false, out) end
     end
+    end)
   end)
 end
 
@@ -602,6 +888,17 @@ function M.push(opts)
       { "rsync", "-az", "-O", "--no-owner", "--no-group", "--info=stats1" },
       detection_flags(cfg, "push")
     )
+    -- Permission/time preservation. Default: preserve (rsync's default
+    -- under -a). When the destination tree is owned by another user
+    -- (typical for /etc/<service>/ pushes via ACL-grant) the writer can
+    -- have rwx without chmod/utime authority — those are owner-only
+    -- syscalls regardless of ACLs. In that case, set `preserve_perms`
+    -- false in .autovim-remote.json to skip the metadata sync that
+    -- would yield "Operation not permitted (1)" errors.
+    if cfg.preserve_perms == false then
+      table.insert(cmd, "--no-perms")
+      table.insert(cmd, "--no-times")
+    end
     vim.list_extend(cmd, exclude_args(cfg.exclude))
     if cfg.delete then table.insert(cmd, "--delete-after") end
     table.insert(cmd, dest_spec(root))
@@ -609,10 +906,11 @@ function M.push(opts)
     run_async(cmd, function(out)
       record(root, "push", out.code, out.stdout, out.stderr)
       if out.code ~= 0 then
-        notify("push failed (exit " .. out.code .. "). <leader>rl for log.", vim.log.levels.ERROR)
-        return
+        if notify_failure("push", out) then return end
+        -- soft fail (perm-skips on local source): the WARN already fired;
+        -- treat as success-with-skips so the post-push pull still runs.
       end
-      notify("push complete")
+      if out.code == 0 then notify("push complete") end
       -- Quiet pull-after-push so HEAD reflects what's on remote post-push.
       -- This is mostly a no-op in the no-other-writer case (pre-push commit
       -- already left HEAD matching working-tree which == what we pushed),
@@ -689,7 +987,7 @@ function M.run_remote_cmd()
     run_async({ "ssh", cfg.host, item.cmd }, function(out)
       record(root, "remote_cmd:" .. item.name, out.code, out.stdout, out.stderr)
       if out.code ~= 0 then
-        notify("'" .. item.name .. "' failed (exit " .. out.code .. "). <leader>rl for log.", vim.log.levels.ERROR)
+        notify_failure("'" .. item.name .. "'", out)
       else
         notify("'" .. item.name .. "' done. <leader>rl for output.")
       end
@@ -760,27 +1058,29 @@ end
 -- Project navigation (<leader>gq / <leader>gQ)
 -- ──────────────────────────────────────────────────────────────────────
 --
--- Discovery: `find` walks up to 5 levels deep from a root, looking for
--- .autovim-remote.json. Root cascade (first one that exists wins):
---   1. ~/Source/Remote          — broadest useful scope; finds projects
---                                 across all VPS-grouping subdirs.
---   2. parent of current project — sibling discovery when (1) absent.
---   3. cwd                       — last resort.
+-- Discovery: `find` walks up to 5 levels deep from a cached **parent**
+-- root, looking for .autovim-remote.json files. The parent is captured
+-- on the first <leader>gq of a navigation session (whatever cwd you
+-- launch from at that moment) and stays put until <leader>gQ drains
+-- the stack back to that root — at which point the parent resets so
+-- the next <leader>gq re-captures from a fresh starting point. This
+-- matches worktree.nvim's gw/gW behavior: the user picks the scope by
+-- :cd-ing first, then triggering the first nav.
 --
--- Stack is in-memory and session-scoped (not persisted). `<leader>gq`
--- pushes current cwd before cd'ing; `<leader>gQ` pops + cd's back.
+-- This means: navigate from /a → /a/proj1 (parent = /a), then <leader>gq
+-- again at /a/proj1 still scans /a and lets you pick /a/proj2. <leader>gQ
+-- pops back through the visited cwds. Find runs fresh on each <leader>gq
+-- — only the parent ROOT is cached, never the project list.
+--
+-- Stack + parent are in-memory and session-scoped (not persisted).
 -- Mirrors worktree.nvim's gw/gW pattern within our own keyspace, without
 -- coupling to worktree.nvim's internal nav stack.
 
-local NAV_DEFAULT_ROOT = "~/Source/Remote"
 local nav_stack = {}
+local nav_parent = nil  -- captured on first gq, cleared when stack drains
 
 local function pick_scan_root()
-  local default = vim.fn.expand(NAV_DEFAULT_ROOT)
-  if vim.fn.isdirectory(default) == 1 then return default end
-  local cur = M.find_project()
-  if cur then return vim.fs.dirname(cur) end
-  return vim.fn.getcwd()
+  return nav_parent or vim.fn.getcwd()
 end
 
 local function scan_for_projects()
@@ -810,11 +1110,20 @@ end
 
 --- Pick a remote project from the discovered list and `:cd` to it. Pushes
 --- the current cwd onto an internal stack so `<leader>gQ` (M.navigate_back)
---- can return.
+--- can return. Captures the cwd as `nav_parent` on the first call of a
+--- navigation session — subsequent calls keep scanning from that parent
+--- so you can hop sideways between sibling projects without :cd-ing back
+--- to the parent first.
 function M.navigate()
+  -- Capture the parent on first nav (or after a full gQ-back drain).
+  if not nav_parent then nav_parent = vim.fn.getcwd() end
+
   local projects, scanned_root = scan_for_projects()
   if #projects == 0 then
     notify("no remote projects found under " .. scanned_root, vim.log.levels.WARN)
+    -- Nothing to navigate to — release the parent so the next gq
+    -- re-captures from wherever the user is then.
+    if #nav_stack == 0 then nav_parent = nil end
     return
   end
 
@@ -828,7 +1137,12 @@ function M.navigate()
     prompt = "Remote project:",
     format_item = function(p) return string.format(fmt, p.name, p.host, p.remote_path) end,
   }, function(choice)
-    if not choice then return end
+    if not choice then
+      -- User dismissed the picker without selecting; release the parent
+      -- if we hadn't already started a navigation session.
+      if #nav_stack == 0 then nav_parent = nil end
+      return
+    end
     local cwd = vim.fn.getcwd()
     if vim.fn.resolve(cwd) == vim.fn.resolve(choice.root) then
       notify("already in " .. choice.name)
@@ -841,7 +1155,8 @@ function M.navigate()
 end
 
 --- Pop the last `<leader>gq` push and `:cd` back. No-op (with notify) if
---- the stack is empty.
+--- the stack is empty. Clears the cached `nav_parent` once the stack
+--- drains so the next gq starts a fresh navigation session.
 function M.navigate_back()
   if #nav_stack == 0 then
     notify("no previous location to return to", vim.log.levels.WARN)
@@ -850,6 +1165,7 @@ function M.navigate_back()
   local prev = table.remove(nav_stack)
   vim.cmd("cd " .. vim.fn.fnameescape(prev))
   notify("← " .. prev)
+  if #nav_stack == 0 then nav_parent = nil end
 end
 
 return M
