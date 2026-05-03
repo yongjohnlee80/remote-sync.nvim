@@ -192,7 +192,7 @@ local function write_default_config(path, host, remote_path)
     "      \"name\": \"grant-acl\",",
     "      \"cmd\": " .. jstr(
       "sudo setfacl -R -m u:$(whoami):rwx -m d:u:$(whoami):rwx " .. remote_path
-    ) .. ",",
+    ),
     "    },",
     "    {",
     "      \"_comment\": " .. jstr(
