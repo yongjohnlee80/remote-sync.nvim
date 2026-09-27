@@ -12,11 +12,11 @@
 -- edits on the remote. The `<leader>Rp` pull is also a `git commit` so the
 -- repo's HEAD is the snapshot baseline; `<leader>Rd` (precheck) compares
 -- the remote against the working tree and surfaces drift before
--- `<leader>Ru` clobbers it. Conflict resolution falls through to git's
+-- `<leader>Rs` clobbers it. Conflict resolution falls through to git's
 -- normal merge — see the ADR for the workflow.
 --
 -- Async via `vim.system` with `text = true`. Long output captured in a
--- per-project state file and viewable via `<leader>Ro` (the log float).
+-- per-project state file and viewable via `<leader>Rl` (the log float).
 
 local M = {}
 
@@ -346,7 +346,7 @@ end
 
 -- Maps common rsync/ssh failure-stderr patterns to a one-line hint that
 -- gets surfaced alongside the bare "(exit N)" message. The full stderr
--- is still in the log buffer (<leader>Ro) — this is just a quick "look
+-- is still in the log buffer (<leader>Rl) — this is just a quick "look
 -- here first" pointer for the most-frequent failure modes. Returns nil
 -- when nothing matches; the caller falls back to the plain exit-code
 -- notify.
@@ -461,7 +461,7 @@ local function notify_failure(action, out)
     local plural = #skips == 1 and "" or "s"
     notify(
       string.format(
-        "%s ok; skipped %d unreadable remote file%s: %s%s\n   → add to `exclude` in .autovim-remote.json, or run privileged on the remote (rsync_path: \"sudo rsync\"). <leader>Ro for log.",
+        "%s ok; skipped %d unreadable remote file%s: %s%s\n   → add to `exclude` in .autovim-remote.json, or run privileged on the remote (rsync_path: \"sudo rsync\"). <leader>Rl for log.",
         action, #skips, plural, first, trailer
       ),
       vim.log.levels.WARN
@@ -469,7 +469,7 @@ local function notify_failure(action, out)
     return false
   end
 
-  local base = action .. " failed (exit " .. out.code .. "). <leader>Ro for log."
+  local base = action .. " failed (exit " .. out.code .. "). <leader>Rl for log."
   local hint = diagnose(out.code, out.stderr)
   if hint then
     notify(hint .. "\n" .. base, vim.log.levels.ERROR)
@@ -853,7 +853,7 @@ function M.drift(opts)
       if not opts.quiet then notify("no drift — remote matches HEAD") end
       if opts.on_done then opts.on_done(true, out) end
     else
-      notify(("drift: %d file(s) differ on remote vs HEAD. <leader>Ro for details."):format(#lines), vim.log.levels.WARN)
+      notify(("drift: %d file(s) differ on remote vs HEAD. <leader>Rl for details."):format(#lines), vim.log.levels.WARN)
       if opts.on_done then opts.on_done(false, out) end
     end
     end)
@@ -989,7 +989,7 @@ function M.run_remote_cmd()
       if out.code ~= 0 then
         notify_failure("'" .. item.name .. "'", out)
       else
-        notify("'" .. item.name .. "' done. <leader>Ro for output.")
+        notify("'" .. item.name .. "' done. <leader>Rl for output.")
       end
     end)
   end
