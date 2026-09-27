@@ -9,14 +9,14 @@
 -- in any project.
 --
 -- Why git-backed: rsync alone can mirror state but can't detect concurrent
--- edits on the remote. The `<leader>rp` pull is also a `git commit` so the
--- repo's HEAD is the snapshot baseline; `<leader>rd` (precheck) compares
+-- edits on the remote. The `<leader>Rp` pull is also a `git commit` so the
+-- repo's HEAD is the snapshot baseline; `<leader>Rd` (precheck) compares
 -- the remote against the working tree and surfaces drift before
--- `<leader>rs` clobbers it. Conflict resolution falls through to git's
+-- `<leader>Ru` clobbers it. Conflict resolution falls through to git's
 -- normal merge — see the ADR for the workflow.
 --
 -- Async via `vim.system` with `text = true`. Long output captured in a
--- per-project state file and viewable via `<leader>rl` (the log float).
+-- per-project state file and viewable via `<leader>Ro` (the log float).
 
 local M = {}
 
@@ -346,7 +346,7 @@ end
 
 -- Maps common rsync/ssh failure-stderr patterns to a one-line hint that
 -- gets surfaced alongside the bare "(exit N)" message. The full stderr
--- is still in the log buffer (<leader>rl) — this is just a quick "look
+-- is still in the log buffer (<leader>Ro) — this is just a quick "look
 -- here first" pointer for the most-frequent failure modes. Returns nil
 -- when nothing matches; the caller falls back to the plain exit-code
 -- notify.
@@ -461,7 +461,7 @@ local function notify_failure(action, out)
     local plural = #skips == 1 and "" or "s"
     notify(
       string.format(
-        "%s ok; skipped %d unreadable remote file%s: %s%s\n   → add to `exclude` in .autovim-remote.json, or run privileged on the remote (rsync_path: \"sudo rsync\"). <leader>rl for log.",
+        "%s ok; skipped %d unreadable remote file%s: %s%s\n   → add to `exclude` in .autovim-remote.json, or run privileged on the remote (rsync_path: \"sudo rsync\"). <leader>Ro for log.",
         action, #skips, plural, first, trailer
       ),
       vim.log.levels.WARN
@@ -469,7 +469,7 @@ local function notify_failure(action, out)
     return false
   end
 
-  local base = action .. " failed (exit " .. out.code .. "). <leader>rl for log."
+  local base = action .. " failed (exit " .. out.code .. "). <leader>Ro for log."
   local hint = diagnose(out.code, out.stderr)
   if hint then
     notify(hint .. "\n" .. base, vim.log.levels.ERROR)
@@ -714,7 +714,7 @@ end
 --- and dest_path (default: cwd / <last-two-of-remote-path joined by ->).
 --- Creates dest_path if missing and writes a default .autovim-remote.json
 --- there. Refuses to overwrite an existing config file. Does not pull —
---- run <leader>rp from inside the dest_path afterward.
+--- run <leader>Rp from inside the dest_path afterward.
 function M.register()
   vim.ui.input({ prompt = "remote-sync: host (user@host or ssh alias) — " }, function(host)
     if not host or vim.trim(host) == "" then notify("register cancelled"); return end
@@ -740,7 +740,7 @@ function M.register()
           notify(config_path .. " already exists — not overwriting", vim.log.levels.WARN); return
         end
         write_default_config(config_path, host, remote_path)
-        notify(("registered → %s\n  host:        %s\n  remote_path: %s\nNext: :cd %s and <leader>rp"):format(dest_path, host, remote_path, dest_path))
+        notify(("registered → %s\n  host:        %s\n  remote_path: %s\nNext: :cd %s and <leader>Rp"):format(dest_path, host, remote_path, dest_path))
       end)
     end)
   end)
@@ -853,7 +853,7 @@ function M.drift(opts)
       if not opts.quiet then notify("no drift — remote matches HEAD") end
       if opts.on_done then opts.on_done(true, out) end
     else
-      notify(("drift: %d file(s) differ on remote vs HEAD. <leader>rl for details."):format(#lines), vim.log.levels.WARN)
+      notify(("drift: %d file(s) differ on remote vs HEAD. <leader>Ro for details."):format(#lines), vim.log.levels.WARN)
       if opts.on_done then opts.on_done(false, out) end
     end
     end)
@@ -945,8 +945,8 @@ function M.push(opts)
       else
         notify(
           "push refused — remote has changes you haven't pulled.\n" ..
-          "  <leader>rp  to pull and merge\n" ..
-          "  <leader>rS  to force-push (drift gate skipped — only when you're sure)",
+          "  <leader>Rp  to pull and merge\n" ..
+          "  <leader>RS  to force-push (drift gate skipped — only when you're sure)",
           vim.log.levels.WARN
         )
       end
@@ -989,7 +989,7 @@ function M.run_remote_cmd()
       if out.code ~= 0 then
         notify_failure("'" .. item.name .. "'", out)
       else
-        notify("'" .. item.name .. "' done. <leader>rl for output.")
+        notify("'" .. item.name .. "' done. <leader>Ro for output.")
       end
     end)
   end
