@@ -21,7 +21,7 @@ Two real-world use cases drive the design:
 
 You run mailcow / forgejo / nginx / vaultwarden / postgres on a server you
 can't develop on directly, but you can rsync into. Edit the configs locally
-(with full LSP, treesitter, dotfiles, AI tooling), ship with `<leader>rs`,
+(with full LSP, treesitter, dotfiles, AI tooling), ship with `<leader>Ru`,
 optionally trigger a service reload over ssh via a project-configured
 command. The drift gate stops you from clobbering changes another admin
 made after your last pull.
@@ -54,9 +54,9 @@ do **not** want extra blast radius).
 
 This plugin sidesteps all three. Develop locally, push to your private
 remote, build locally — then rsync the result (built artifacts, or the
-source plus a remote build hook) straight into the VPS with `<leader>rs`.
+source plus a remote build hook) straight into the VPS with `<leader>Ru`.
 Production never needs a git client, a deploy key, or a PAT. Pair with
-a `commands` array (see schema below) so `<leader>rc` triggers
+a `commands` array (see schema below) so `<leader>Rc` triggers
 `docker compose up -d --build`, `systemctl restart <svc>`, `pnpm
 install && pm2 reload`, or whatever finishes the deploy — all over the
 same ssh connection that did the push.
@@ -100,15 +100,18 @@ same ssh connection that did the push.
   "yongjohnlee80/remote-sync.nvim",
   -- No setup() required. Plugin self-registers user commands on load.
   -- Bind your own keys (suggested defaults below) or use the :RemoteSync*
-  -- commands directly.
+  -- commands directly. The defaults live under <leader>R: <leader>r is
+  -- auto-run.nvim's run namespace in AutoVim. Push is Ru (upload) and the log
+  -- is Ro (output) because AutoVim's REST client (kulala) holds Rs and Rl.
+  -- The plugin's own messages name these keys.
   keys = {
-    { "<leader>rp", function() require("remote-sync").pull() end, desc = "Remote: pull" },
-    { "<leader>rd", function() require("remote-sync").drift() end, desc = "Remote: drift report" },
-    { "<leader>rs", function() require("remote-sync").push() end, desc = "Remote: push" },
-    { "<leader>rS", "<cmd>RemoteSyncForcePush<cr>",                desc = "Remote: FORCE push" },
-    { "<leader>rc", function() require("remote-sync").run_remote_cmd() end, desc = "Remote: run remote command" },
-    { "<leader>rl", function() require("remote-sync").show_log() end, desc = "Remote: show last sync log" },
-    { "<leader>rR", function() require("remote-sync").register() end, desc = "Remote: register new project" },
+    { "<leader>Rp", function() require("remote-sync").pull() end, desc = "Remote: pull" },
+    { "<leader>Rd", function() require("remote-sync").drift() end, desc = "Remote: drift report" },
+    { "<leader>Ru", function() require("remote-sync").push() end, desc = "Remote: push" },
+    { "<leader>RS", "<cmd>RemoteSyncForcePush<cr>",                desc = "Remote: FORCE push" },
+    { "<leader>Rc", function() require("remote-sync").run_remote_cmd() end, desc = "Remote: run remote command" },
+    { "<leader>Ro", function() require("remote-sync").show_log() end, desc = "Remote: show last sync log" },
+    { "<leader>RR", function() require("remote-sync").register() end, desc = "Remote: register new project" },
     { "<leader>gq", function() require("remote-sync").navigate() end, desc = "Remote: pick a project" },
     { "<leader>gQ", function() require("remote-sync").navigate_back() end, desc = "Remote: cd back" },
   },
@@ -340,7 +343,7 @@ it survive a year of real use.
 
 Issues / PRs welcome. Bugs especially — drift detection has been
 through three rewrites; if you find a fourth failure mode, please open
-an issue with the `<leader>rl` log output.
+an issue with the `<leader>Ro` log output.
 
 ---
 
